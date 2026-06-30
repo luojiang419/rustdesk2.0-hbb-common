@@ -51,6 +51,38 @@ pub const READ_TIMEOUT: u64 = 18_000;
 pub const REG_INTERVAL: i64 = 15_000;
 pub const COMPRESS_LEVEL: i32 = 3;
 const SERIAL: i32 = 3;
+const OPTION_SERVER_PROFILES: &str = "server-profiles";
+const OPTION_AUTO_SERVER_SWITCH_THRESHOLD_MS: &str = "auto-server-switch-threshold-ms";
+const DEFAULT_AUTO_SERVER_SWITCH_THRESHOLD_MS: i64 = 300;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerProfileOption {
+    id_server: String,
+    #[serde(default = "default_server_profile_enabled")]
+    enabled: bool,
+}
+
+fn default_server_profile_enabled() -> bool {
+    true
+}
+
+fn parse_server_profile_options(json: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<ServerProfileOption>>(json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|profile| profile.enabled && !profile.id_server.trim().is_empty())
+        .map(|profile| profile.id_server.trim().trim_end_matches('/').to_owned())
+        .collect()
+}
+
+fn profile_servers_contain(servers: &[String], selected: &str) -> bool {
+    servers.iter().any(|server| {
+        server == selected
+            || crate::socket_client::check_port(server, RENDEZVOUS_PORT)
+                == crate::socket_client::check_port(selected, RENDEZVOUS_PORT)
+    })
+}
 
 #[cfg(target_os = "macos")]
 lazy_static::lazy_static! {
@@ -69,7 +101,7 @@ lazy_static::lazy_static! {
     static ref ONLINE: Mutex<HashMap<String, i64>> = Default::default();
     pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("".to_owned());
     pub static ref EXE_RENDEZVOUS_SERVER: RwLock<String> = Default::default();
-    pub static ref APP_NAME: RwLock<String> = RwLock::new("RustDesk".to_owned());
+    pub static ref APP_NAME: RwLock<String> = RwLock::new("rustdesk2.0".to_owned());
     static ref KEY_PAIR: Mutex<Option<KeyPair>> = Default::default();
     static ref USER_DEFAULT_CONFIG: RwLock<(UserDefaultConfig, Instant)> = RwLock::new((UserDefaultConfig::load(), Instant::now()));
     pub static ref NEW_STORED_PEER_CONFIG: Mutex<HashSet<String>> = Default::default();
@@ -913,6 +945,18 @@ impl Config {
     pub fn get_rendezvous_server() -> String {
         let mut rendezvous_server = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
         if rendezvous_server.is_empty() {
+            let profile_servers =
+                parse_server_profile_options(&Self::get_option(OPTION_SERVER_PROFILES));
+            if !profile_servers.is_empty() {
+                let selected = CONFIG2.read().unwrap().rendezvous_server.clone();
+                rendezvous_server = if profile_servers_contain(&profile_servers, &selected) {
+                    selected
+                } else {
+                    profile_servers.into_iter().next().unwrap_or_default()
+                };
+            }
+        }
+        if rendezvous_server.is_empty() {
             rendezvous_server = Self::get_option("custom-rendezvous-server");
         }
         if rendezvous_server.is_empty() {
@@ -937,6 +981,10 @@ impl Config {
         let s = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
         if !s.is_empty() {
             return vec![s];
+        }
+        let ss = parse_server_profile_options(&Self::get_option(OPTION_SERVER_PROFILES));
+        if !ss.is_empty() {
+            return ss;
         }
         let s = Self::get_option("custom-rendezvous-server");
         if !s.is_empty() {
@@ -966,20 +1014,44 @@ impl Config {
 
     pub fn update_latency(host: &str, latency: i64) {
         ONLINE.lock().unwrap().insert(host.to_owned(), latency);
-        let mut host = "".to_owned();
-        let mut delay = i64::MAX;
-        for (tmp_host, tmp_delay) in ONLINE.lock().unwrap().iter() {
-            if tmp_delay > &0 && tmp_delay < &delay {
-                delay = *tmp_delay;
-                host = tmp_host.to_string();
+        let mut best_host = "".to_owned();
+        let mut best_delay = i64::MAX;
+        let online = ONLINE.lock().unwrap();
+        for (tmp_host, tmp_delay) in online.iter() {
+            if tmp_delay > &0 && tmp_delay < &best_delay {
+                best_delay = *tmp_delay;
+                best_host = tmp_host.to_string();
             }
         }
-        if !host.is_empty() {
+        if !best_host.is_empty() {
+            let threshold_us = Self::get_option(OPTION_AUTO_SERVER_SWITCH_THRESHOLD_MS)
+                .parse::<i64>()
+                .unwrap_or(DEFAULT_AUTO_SERVER_SWITCH_THRESHOLD_MS)
+                * 1000;
             let mut config = CONFIG2.write().unwrap();
-            if host != config.rendezvous_server {
-                log::debug!("Update rendezvous_server in config to {}", host);
-                log::debug!("{:?}", *ONLINE.lock().unwrap());
-                config.rendezvous_server = host;
+            if best_host != config.rendezvous_server {
+                let current_delay = online.get(&config.rendezvous_server).copied().or_else(|| {
+                    online
+                        .iter()
+                        .find(|(server, _)| {
+                            crate::socket_client::check_port(server, RENDEZVOUS_PORT)
+                                == crate::socket_client::check_port(
+                                    &config.rendezvous_server,
+                                    RENDEZVOUS_PORT,
+                                )
+                        })
+                        .map(|(_, delay)| *delay)
+                });
+                let should_switch = config.rendezvous_server.is_empty()
+                    || current_delay
+                        .map(|delay| delay <= 0 || (delay > threshold_us && best_delay < delay))
+                        .unwrap_or(true);
+                if !should_switch {
+                    return;
+                }
+                log::debug!("Update rendezvous_server in config to {}", best_host);
+                log::debug!("{:?}", *online);
+                config.rendezvous_server = best_host;
                 config.store();
             }
         }
