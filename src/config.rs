@@ -61,6 +61,8 @@ struct ServerProfileOption {
     id_server: String,
     #[serde(default = "default_server_profile_enabled")]
     enabled: bool,
+    #[serde(default)]
+    preferred: bool,
 }
 
 fn default_server_profile_enabled() -> bool {
@@ -68,10 +70,17 @@ fn default_server_profile_enabled() -> bool {
 }
 
 fn parse_server_profile_options(json: &str) -> Vec<String> {
-    serde_json::from_str::<Vec<ServerProfileOption>>(json)
+    let mut profiles = serde_json::from_str::<Vec<ServerProfileOption>>(json)
         .unwrap_or_default()
         .into_iter()
         .filter(|profile| profile.enabled && !profile.id_server.trim().is_empty())
+        .collect::<Vec<_>>();
+    if let Some(index) = profiles.iter().position(|profile| profile.preferred) {
+        let preferred = profiles.remove(index);
+        profiles.insert(0, preferred);
+    }
+    profiles
+        .into_iter()
         .map(|profile| profile.id_server.trim().trim_end_matches('/').to_owned())
         .collect()
 }
@@ -3358,6 +3367,38 @@ mod tests {
     struct ConfigFileRestoreGuard {
         path: PathBuf,
         original_content: Option<Vec<u8>>,
+    }
+
+    #[test]
+    fn server_profile_options_are_ordered_preferred_first() {
+        let servers = parse_server_profile_options(
+            r#"[
+                {"idServer":"a.example.test","enabled":true},
+                {"idServer":"b.example.test","enabled":true,"preferred":true},
+                {"idServer":"c.example.test","enabled":true}
+            ]"#,
+        );
+
+        assert_eq!(
+            servers,
+            vec![
+                "b.example.test".to_owned(),
+                "a.example.test".to_owned(),
+                "c.example.test".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn server_profile_options_ignore_disabled_preferred() {
+        let servers = parse_server_profile_options(
+            r#"[
+                {"idServer":"a.example.test","enabled":false,"preferred":true},
+                {"idServer":"b.example.test","enabled":true}
+            ]"#,
+        );
+
+        assert_eq!(servers, vec!["b.example.test".to_owned()]);
     }
 
     impl ConfigStateTestGuard {
